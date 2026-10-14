@@ -1,99 +1,996 @@
 const INTERACTIONS_URL = "https://generativelanguage.googleapis.com/v1beta/interactions";
-const FAST_MODEL = "models/gemini-3.8-flash";
-const ADVISOR_MODEL = "models/gemini-3.1-pro-preview";
-const CONSENSUS_MODELS = ["models/gemini-3.8-flash", "models/gemini-3.5-flash", "models/gemini-3.1-pro-preview"];
-const TOOLS = [{ type: "code_execution" }, { type: "google_search" }, { type: "url_context" }];
+const FAST_MODEL = "gemini-3.8-flash";
+const ADVISOR_MODEL = "gemini-3.1-pro-preview";
+const CONSENSUS_MODELS: readonly string[] = ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.1-pro-preview"];
+const TOOLS: readonly { readonly type: "code_execution" | "google_search" | "url_context" }[] = [
+  { type: "code_execution" },
+  { type: "google_search" },
+  { type: "url_context" },
+];
 
-export type SubagentResult = { status: "completed" | "error"; result: Record<string, unknown> };
+const MAX_RETRIES = 2;
+const MAX_RETRY_AFTER_MS = 60000;
+const MIN_RETRY_DELAY_MS = 500;
+const MAX_ERROR_EXCERPT_CODE_POINTS = 500;
+const MAX_SYNTHESIS_ANSWER_CODE_POINTS = 12000;
+const POLL_INTERVAL_MS = 1500;
+const POLL_MAX_INTERVAL_MS = 10000;
+const MAX_POLL_DURATION_MS = 1800000;
+const ATTEMPT_TIMEOUT_MS = 120000;
+const MAX_RESUME_ATTEMPTS = 3;
+const MAX_EXTRACTION_DEPTH = 128;
+const MAX_OUTPUT_TOKENS = 65536;
+const THINKING_LEVEL = "high";
 
-function collectText(value: unknown, out: string[]): void {
-  if (Array.isArray(value)) {
-    for (const item of value) collectText(item, out);
+const RETRYABLE_HTTP_STATUSES: ReadonlySet<number> = new Set([408, 429, 500, 502, 503, 504]);
+const THOUGHT_MARKERS: ReadonlySet<string> = new Set(["thought", "thinking", "reasoning"]);
+const NON_ANSWER_TYPES: ReadonlySet<string> = new Set([
+  "thought",
+  "thinking",
+  "reasoning",
+  "user_input",
+  "function_call",
+  "function_result",
+  "code_execution_result",
+  "code_execution_output",
+  "tool_result",
+]);
+const WALK_KEYS: readonly string[] = ["outputs", "steps", "content", "parts", "candidates", "output"];
+const FAILURE_STATUSES: ReadonlySet<string> = new Set(["failed", "error", "cancelled", "canceled", "expired"]);
+const PENDING_STATUSES: ReadonlySet<string> = new Set(["in_progress", "pending", "running", "processing", "queued"]);
+const SUCCESS_STATUSES: ReadonlySet<string> = new Set(["completed", "succeeded", "done"]);
+const INCOMPLETE_STATUS = "incomplete";
+const MODEL_PREFIX = "models/";
+
+const CONTINUATION_TOKEN_KEYS: readonly string[] = [
+  "output_token",
+  "resumable_token",
+  "continuation_token",
+  "resume_token",
+  "token",
+];
+
+const MISSING_KEY_MESSAGE = "A GEMINI_API_KEY nincs beállítva.";
+const GENERIC_FAILURE_MESSAGE = "Az alügynök hibával leállt.";
+const ABORTED_MESSAGE = "A művelet megszakítva.";
+const ABORT_INTERNAL_MESSAGE = "A műveletet megszakították.";
+const NO_MODEL_ANSWERED_MESSAGE = "Egyik modell sem válaszolt.";
+const INCOMPLETE_MARKER = "\n[csonkítva: a generálás elérte a kimeneti korlátot (incomplete)]";
+const TRUNCATED_MARKER = "\n[csonkítva]";
+const REDACTED = "[redacted]";
+
+export type SubagentAnswer = { model: string; answer: string };
+
+export type SubagentErrorPayload = {
+  code: "SUBAGENT_FAILED" | "ABORTED";
+  message: string;
+  failures?: string[];
+  answers?: SubagentAnswer[];
+  synthesis_error?: string;
+};
+
+export type SubagentDelegateResult = { status: "completed"; result: { model: string; answer: string } };
+export type SubagentAdvisorResult = { status: "completed"; result: { model: string; advice: string } };
+export type SubagentConsensusResult = {
+  status: "completed";
+  result: { consensus: string; answers: SubagentAnswer[]; failures: string[] };
+};
+export type SubagentErrorResult = { status: "error"; result: SubagentErrorPayload };
+
+export type SubagentResult =
+  | SubagentDelegateResult
+  | SubagentAdvisorResult
+  | SubagentConsensusResult
+  | SubagentErrorResult;
+
+type HttpFailure = {
+  message: string;
+  status: string | null;
+  parsedMessage: string | null;
+  retryDelayMs: number | null;
+  permanentQuota: boolean;
+};
+
+type HttpRequest = { url: string; method: "GET" | "POST"; body: string | null };
+
+type Interpretation =
+  | { readonly kind: "complete"; readonly text: string }
+  | { readonly kind: "pending"; readonly id: string }
+  | { readonly kind: "incomplete"; readonly text: string; readonly continuationToken: string | null };
+
+type ModelAnswer = { model: string; text: string; continuationToken: string | null };
+
+type TimeoutHandle = { readonly signal: AbortSignal; readonly clear: () => void };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function own(record: Record<string, unknown>, key: string): unknown {
+  return Object.prototype.hasOwnProperty.call(record, key) ? record[key] : undefined;
+}
+
+function ownString(record: Record<string, unknown>, key: string): string | null {
+  const value = own(record, key);
+  return typeof value === "string" ? value : null;
+}
+
+function ownNonEmptyString(record: Record<string, unknown>, key: string): string | null {
+  const value = ownString(record, key);
+  if (value === null) return null;
+  return value.trim() === "" ? null : value;
+}
+
+function normalizedType(record: Record<string, unknown>): string | null {
+  const type = ownString(record, "type");
+  if (type === null) return null;
+  const trimmed = type.trim().toLowerCase();
+  return trimmed === "" ? null : trimmed;
+}
+
+function normalizeModelId(model: string): string {
+  const trimmed = model.trim();
+  return trimmed.startsWith(MODEL_PREFIX) ? trimmed.slice(MODEL_PREFIX.length) : trimmed;
+}
+
+function readApiKey(): string {
+  const raw = process.env["GEMINI_API_KEY"];
+  if (typeof raw !== "string") throw new Error(MISSING_KEY_MESSAGE);
+  const key = raw.trim();
+  if (key === "") throw new Error(MISSING_KEY_MESSAGE);
+  return key;
+}
+
+function currentApiKey(): string {
+  const raw = process.env["GEMINI_API_KEY"];
+  return typeof raw === "string" ? raw.trim() : "";
+}
+
+function abortError(): Error {
+  const error = new Error(ABORT_INTERNAL_MESSAGE);
+  error.name = "AbortError";
+  return error;
+}
+
+function isAbortError(value: unknown): boolean {
+  if (value instanceof Error && value.name === "AbortError") return true;
+  if (isRecord(value) && ownString(value, "name") === "AbortError") return true;
+  return false;
+}
+
+function rawMessage(value: unknown): string {
+  if (value instanceof Error) {
+    const message = value.message;
+    if (typeof message === "string" && message.trim() !== "") return message;
+  }
+  if (typeof value === "string" && value.trim() !== "") return value;
+  if (isRecord(value)) {
+    const message = ownNonEmptyString(value, "message");
+    if (message !== null) return message;
+  }
+  return GENERIC_FAILURE_MESSAGE;
+}
+
+function capCodePoints(value: string, limit: number, marker: string): string {
+  const points = Array.from(value);
+  if (points.length <= limit) return value;
+  return `${points.slice(0, limit).join("")}${marker}`;
+}
+
+function redact(value: string, secret: string): string {
+  let out = value;
+  if (secret !== "" && out.includes(secret)) out = out.split(secret).join(REDACTED);
+  out = out.replace(/AIza[0-9A-Za-z_-]{20,}/g, REDACTED);
+  out = out.replace(/(x-goog-api-key|authorization)(\s*[:=]\s*)\S+/gi, `$1$2${REDACTED}`);
+  return out;
+}
+
+function safeExcerpt(value: string, secret: string): string {
+  return capCodePoints(redact(value, secret), MAX_ERROR_EXCERPT_CODE_POINTS, "…");
+}
+
+function safeMessage(value: unknown, secret: string = currentApiKey()): string {
+  return safeExcerpt(rawMessage(value), secret);
+}
+
+function parseRetryAfter(header: string | null, nowMs: number): number | null {
+  if (header === null) return null;
+  const raw = header.trim();
+  if (raw === "") return null;
+  if (/^\d+(?:\.\d+)?$/.test(raw)) {
+    const seconds = Number(raw);
+    if (!Number.isFinite(seconds)) return null;
+    return Math.max(0, Math.round(seconds * 1000));
+  }
+  const parsed = Date.parse(raw);
+  if (Number.isNaN(parsed)) return null;
+  return Math.max(0, parsed - nowMs);
+}
+
+function parseDurationMs(value: unknown): number | null {
+  if (typeof value === "string") {
+    const match = /^\s*(\d+(?:\.\d+)?)s\s*$/.exec(value);
+    if (match === null || match[1] === undefined) return null;
+    const seconds = Number(match[1]);
+    if (!Number.isFinite(seconds)) return null;
+    return Math.max(0, Math.round(seconds * 1000));
+  }
+  if (isRecord(value)) {
+    const secondsRaw = own(value, "seconds");
+    const nanosRaw = own(value, "nanos");
+    const hasSeconds =
+      secondsRaw !== undefined && secondsRaw !== null && secondsRaw !== 0 && secondsRaw !== "0";
+    const hasNanos =
+      nanosRaw !== undefined && nanosRaw !== null && nanosRaw !== 0 && nanosRaw !== "0";
+    if (!hasSeconds && !hasNanos) return null;
+    const seconds =
+      typeof secondsRaw === "number"
+        ? secondsRaw
+        : typeof secondsRaw === "string"
+          ? Number(secondsRaw)
+          : 0;
+    const nanos =
+      typeof nanosRaw === "number"
+        ? nanosRaw
+        : typeof nanosRaw === "string"
+          ? Number(nanosRaw)
+          : 0;
+    if (!Number.isFinite(seconds) || !Number.isFinite(nanos)) return null;
+    const ms = seconds * 1000 + nanos / 1000000;
+    if (!Number.isFinite(ms)) return null;
+    return Math.max(0, Math.round(ms));
+  }
+  return null;
+}
+
+function backoffDelay(attempt: number): number {
+  return 2000 * 2 ** attempt + Math.random() * 1000;
+}
+
+function effectiveDelay(serverDelayMs: number | null, attempt: number): number {
+  const exponential = backoffDelay(attempt);
+  if (serverDelayMs === null) return exponential;
+  return Math.max(serverDelayMs, exponential, MIN_RETRY_DELAY_MS);
+}
+
+function delay(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    if (signal.aborted) {
+      reject(abortError());
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const onAbort = (): void => {
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      reject(abortError());
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    timer = setTimeout(() => {
+      timer = null;
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, Math.max(0, Math.floor(ms)));
+  });
+}
+
+function createTimeoutSignal(parent: AbortSignal, ms: number): TimeoutHandle {
+  const controller = new AbortController();
+  if (parent.aborted) {
+    controller.abort(parent.reason ?? abortError());
+    return { signal: controller.signal, clear: () => {} };
+  }
+  const onParentAbort = (): void => {
+    controller.abort(parent.reason ?? abortError());
+  };
+  parent.addEventListener("abort", onParentAbort, { once: true });
+  const timer = setTimeout(() => {
+    const timeoutError = new Error("Időtúllépés a kérés végrehajtása során.");
+    timeoutError.name = "AbortError";
+    controller.abort(timeoutError);
+  }, Math.max(0, Math.floor(ms)));
+  return {
+    signal: controller.signal,
+    clear: () => {
+      clearTimeout(timer);
+      parent.removeEventListener("abort", onParentAbort);
+    },
+  };
+}
+
+function pushText(out: string[], value: string): void {
+  if (value.trim() === "") return;
+  const last = out.length > 0 ? out[out.length - 1] : undefined;
+  if (last === value) return;
+  out.push(value);
+}
+
+function isThoughtNode(record: Record<string, unknown>): boolean {
+  const type = normalizedType(record);
+  if (type !== null && THOUGHT_MARKERS.has(type)) return true;
+  const role = ownString(record, "role");
+  if (role !== null && THOUGHT_MARKERS.has(role.trim().toLowerCase())) return true;
+  return own(record, "thought") === true;
+}
+
+function isNonAnswerNode(record: Record<string, unknown>): boolean {
+  if (isThoughtNode(record)) return true;
+  const type = normalizedType(record);
+  if (type !== null && NON_ANSWER_TYPES.has(type)) return true;
+  const role = ownString(record, "role");
+  return role !== null && role.trim().toLowerCase() === "user";
+}
+
+function collectTextBlocks(content: unknown, out: string[]): void {
+  if (typeof content === "string") {
+    pushText(out, content);
     return;
   }
-  if (!value || typeof value !== "object") return;
-  const record = value as Record<string, unknown>;
-  if (record.type === "text" && typeof record.text === "string") out.push(record.text);
-  for (const key of ["outputs", "steps", "content", "parts"]) {
-    if (key in record) collectText(record[key], out);
-  }
-}
-
-async function interact(model: string, input: string, signal: AbortSignal): Promise<{ model: string; text: string }> {
-  const key = process.env["GEMINI_API_KEY"];
-  if (!key) throw new Error("A GEMINI_API_KEY nincs beállítva.");
-  let attempt = 0;
-  for (;;) {
-    const response = await fetch(INTERACTIONS_URL, {
-      method: "POST",
-      headers: { "x-goog-api-key": key, "Content-Type": "application/json" },
-      body: JSON.stringify({ model, input, tools: TOOLS, generation_config: { max_output_tokens: 65536, thinking_level: "high" } }),
-      signal,
-    });
-    const body = await response.text();
-    if (response.ok) {
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(body);
-      } catch {
-        throw new Error(`${model}: érvénytelen válasz.`);
-      }
-      const parts: string[] = [];
-      collectText(parsed, parts);
-      const text = parts.join("\n").trim();
-      if (!text) throw new Error(`${model}: üres válasz.`);
-      return { model, text };
-    }
-    let message = body.slice(0, 500);
-    try {
-      const parsed = JSON.parse(body) as { error?: { message?: string } };
-      if (parsed.error?.message) message = parsed.error.message;
-    } catch {}
-    if ((response.status === 429 || response.status >= 500) && attempt < 2 && !/quota/i.test(message)) {
-      attempt += 1;
-      const wait = Number(response.headers.get("retry-after")) * 1000 || 2000 * 2 ** attempt + Math.random() * 1000;
-      await new Promise((resolve) => setTimeout(resolve, wait));
+  if (!Array.isArray(content)) return;
+  for (const block of content) {
+    if (typeof block === "string") {
+      pushText(out, block);
       continue;
     }
-    throw new Error(`${model} (${response.status}): ${message}`);
+    if (!isRecord(block) || isThoughtNode(block)) continue;
+    const type = normalizedType(block);
+    if (type !== null && type !== "text") continue;
+    const text = ownString(block, "text");
+    if (text !== null) pushText(out, text);
   }
 }
 
-function errorResult(error: unknown): SubagentResult {
-  return { status: "error", result: { code: "SUBAGENT_FAILED", message: error instanceof Error ? error.message : "Az alügynök hibával leállt." } };
+function extractFromSteps(steps: readonly unknown[]): string | null {
+  let startIndex = 0;
+  for (let index = 0; index < steps.length; index++) {
+    const step = steps[index];
+    if (isRecord(step) && normalizedType(step) === "user_input") startIndex = index + 1;
+  }
+  let sawModelOutput = false;
+  const parts: string[] = [];
+  for (let index = startIndex; index < steps.length; index++) {
+    const step = steps[index];
+    if (!isRecord(step) || normalizedType(step) !== "model_output") continue;
+    sawModelOutput = true;
+    collectTextBlocks(own(step, "content"), parts);
+  }
+  if (!sawModelOutput) return null;
+  const joined = parts.join("\n").trim();
+  if (joined === "") return null;
+  return joined;
 }
 
-export async function delegateTask(task: string, context: string, signal: AbortSignal): Promise<SubagentResult> {
-  try {
-    const input = `Önálló alügynök vagy. Hajtsd végre pontosan a részfeladatot; kódfuttatást, Google keresést és URL-olvasást használhatsz. Adj tömör, ellenőrzött eredményt magyarul, forrásokkal ha kerestél.\n\nKontextus:\n${context || "nincs"}\n\nRészfeladat:\n${task}`;
-    const answer = await interact(FAST_MODEL, input, signal);
-    return { status: "completed", result: { model: answer.model, answer: answer.text } };
-  } catch (error) {
-    return errorResult(error);
+function extractFromOutputs(outputs: readonly unknown[]): string | null {
+  let sawText = false;
+  const parts: string[] = [];
+  for (const item of outputs) {
+    if (!isRecord(item) || isThoughtNode(item)) continue;
+    if (normalizedType(item) !== "text") continue;
+    const text = ownString(item, "text");
+    if (text === null) continue;
+    sawText = true;
+    pushText(parts, text);
+  }
+  if (!sawText) return null;
+  const joined = parts.join("\n").trim();
+  if (joined === "") return null;
+  return joined;
+}
+
+function collectVisibleText(value: unknown, out: string[], depth: number, seen: Set<object>): void {
+  if (depth > MAX_EXTRACTION_DEPTH) return;
+  if (Array.isArray(value)) {
+    if (seen.has(value)) return;
+    seen.add(value);
+    for (const item of value) collectVisibleText(item, out, depth + 1, seen);
+    return;
+  }
+  if (!isRecord(value)) return;
+  if (seen.has(value)) return;
+  seen.add(value);
+  if (isNonAnswerNode(value)) return;
+  const text = ownString(value, "text");
+  if (text !== null) pushText(out, text);
+  const outputText = ownString(value, "output_text");
+  if (outputText !== null) pushText(out, outputText);
+  const content = ownString(value, "content");
+  if (content !== null) pushText(out, content);
+  for (const key of WALK_KEYS) {
+    const child = own(value, key);
+    if (Array.isArray(child) || isRecord(child)) collectVisibleText(child, out, depth + 1, seen);
   }
 }
 
-export async function consultAdvisor(question: string, context: string, signal: AbortSignal): Promise<SubagentResult> {
+function extractVisibleText(value: unknown): string {
+  if (isRecord(value)) {
+    const steps = own(value, "steps");
+    if (Array.isArray(steps)) {
+      const fromSteps = extractFromSteps(steps);
+      if (fromSteps !== null) return fromSteps;
+    }
+    const outputs = own(value, "outputs");
+    if (Array.isArray(outputs)) {
+      const fromOutputs = extractFromOutputs(outputs);
+      if (fromOutputs !== null) return fromOutputs;
+    }
+  }
+  const parts: string[] = [];
+  collectVisibleText(value, parts, 0, new Set<object>());
+  return parts.join("\n").trim();
+}
+
+function extractContinuationToken(parsed: Record<string, unknown>): string | null {
+  for (const key of CONTINUATION_TOKEN_KEYS) {
+    const value = ownNonEmptyString(parsed, key);
+    if (value !== null) return value;
+  }
+  const metadata = own(parsed, "metadata");
+  if (isRecord(metadata)) {
+    for (const key of CONTINUATION_TOKEN_KEYS) {
+      const value = ownNonEmptyString(metadata, key);
+      if (value !== null) return value;
+    }
+  }
+  const generationMetadata = own(parsed, "generation_metadata");
+  if (isRecord(generationMetadata)) {
+    for (const key of CONTINUATION_TOKEN_KEYS) {
+      const value = ownNonEmptyString(generationMetadata, key);
+      if (value !== null) return value;
+    }
+  }
+  return null;
+}
+
+function inspectErrorDetails(details: unknown): {
+  retryDelayMs: number | null;
+  permanentQuota: boolean;
+} {
+  let retryDelayMs: number | null = null;
+  let permanentQuota = false;
+  if (!Array.isArray(details)) return { retryDelayMs, permanentQuota };
+  for (const detail of details) {
+    if (!isRecord(detail)) continue;
+    const typeUrl = ownString(detail, "@type") ?? "";
+    if (typeUrl.endsWith("google.rpc.RetryInfo")) {
+      const parsedDelay = parseDurationMs(
+        own(detail, "retryDelay") ?? own(detail, "retry_delay"),
+      );
+      if (parsedDelay !== null)
+        retryDelayMs = retryDelayMs === null ? parsedDelay : Math.max(retryDelayMs, parsedDelay);
+    }
+    if (typeUrl.endsWith("google.rpc.QuotaFailure")) {
+      const violations = own(detail, "violations");
+      if (!Array.isArray(violations)) continue;
+      for (const violation of violations) {
+        if (!isRecord(violation)) continue;
+        const descriptor = [
+          ownString(violation, "quotaId"),
+          ownString(violation, "quota_id"),
+          ownString(violation, "quotaMetric"),
+          ownString(violation, "quota_metric"),
+          ownString(violation, "subject"),
+          ownString(violation, "description"),
+        ]
+          .filter((item): item is string => item !== null)
+          .join(" ");
+        if (/per[\s_-]?day|daily/i.test(descriptor)) permanentQuota = true;
+      }
+    }
+  }
+  return { retryDelayMs, permanentQuota };
+}
+
+function describeHttpFailure(body: string, apiKey: string, httpStatus: number): HttpFailure {
+  let parsedMessage: string | null = null;
+  let status: string | null = null;
+  let retryDelayMs: number | null = null;
+  let permanentQuota = false;
   try {
-    const input = `Szakértő tanácsadó vagy egy autonóm ügynök mellett. Elemezd a helyzetet, mutass rá hibákra és kockázatokra, és adj konkrét, sorrendbe állított javaslatot a továbblépésre magyarul.\n\nHelyzet:\n${context || "nincs"}\n\nKérdés:\n${question}`;
-    const answer = await interact(ADVISOR_MODEL, input, signal);
-    return { status: "completed", result: { model: answer.model, advice: answer.text } };
-  } catch (error) {
-    return errorResult(error);
+    const parsed: unknown = JSON.parse(body);
+    if (isRecord(parsed)) {
+      const errorNode = own(parsed, "error");
+      if (isRecord(errorNode)) {
+        parsedMessage = ownNonEmptyString(errorNode, "message");
+        status = ownNonEmptyString(errorNode, "status");
+        const inspected = inspectErrorDetails(own(errorNode, "details"));
+        retryDelayMs = inspected.retryDelayMs;
+        permanentQuota = inspected.permanentQuota;
+      } else if (typeof errorNode === "string" && errorNode.trim() !== "") {
+        parsedMessage = errorNode;
+      }
+    }
+  } catch {
+    parsedMessage = null;
+  }
+  const fallback = body.trim() === "" ? `HTTP ${httpStatus}` : body;
+  const chosen = parsedMessage !== null ? parsedMessage : status !== null ? status : fallback;
+  const excerpt = safeExcerpt(chosen, apiKey);
+  const heuristicSource = parsedMessage !== null ? parsedMessage : status !== null ? status : "";
+  if (
+    heuristicSource !== "" &&
+    /billing|limit:\s*0\b|per[\s_-]?day|daily/i.test(heuristicSource)
+  )
+    permanentQuota = true;
+  return { message: excerpt, status, parsedMessage, retryDelayMs, permanentQuota };
+}
+
+function isRetryableFailure(httpStatus: number, failure: HttpFailure): boolean {
+  if (!RETRYABLE_HTTP_STATUSES.has(httpStatus)) return false;
+  if (failure.permanentQuota) return false;
+  if (failure.retryDelayMs !== null && failure.retryDelayMs > MAX_RETRY_AFTER_MS) return false;
+  const status = failure.status === null ? "" : failure.status.trim().toUpperCase();
+  if (status === "RESOURCE_EXHAUSTED" && httpStatus !== 429) return false;
+  return true;
+}
+
+function interpret(model: string, parsed: unknown, apiKey: string): Interpretation {
+  if (!isRecord(parsed)) {
+    throw new Error(`${model}: érvénytelen válasz (nem objektum).`);
+  }
+  const errorNode = own(parsed, "error");
+  if (isRecord(errorNode)) {
+    const errorMessage = ownNonEmptyString(errorNode, "message");
+    const errorStatus = ownNonEmptyString(errorNode, "status");
+    const detail =
+      errorMessage !== null
+        ? errorMessage
+        : errorStatus !== null
+          ? errorStatus
+          : "a válasz hibát tartalmaz.";
+    throw new Error(`${model}: ${safeExcerpt(detail, apiKey)}`);
+  }
+  if (typeof errorNode === "string" && errorNode.trim() !== "") {
+    throw new Error(`${model}: ${safeExcerpt(errorNode, apiKey)}`);
+  }
+  const statusRaw = ownString(parsed, "status");
+  const statusLabel = statusRaw === null ? "" : statusRaw.trim();
+  const status = statusLabel === "" ? null : statusLabel.toLowerCase();
+  const identifier = ownNonEmptyString(parsed, "id") ?? ownNonEmptyString(parsed, "name");
+  const statusMessage = ownNonEmptyString(parsed, "message");
+  if (status !== null && FAILURE_STATUSES.has(status)) {
+    const detail =
+      statusMessage === null ? "" : ` (${safeExcerpt(statusMessage, apiKey)})`;
+    throw new Error(
+      `${model}: a futás ${safeExcerpt(statusLabel, apiKey)} állapotban ért véget.${detail}`,
+    );
+  }
+  if (status === "requires_action") {
+    const idPart =
+      identifier === null
+        ? ""
+        : ` (azonosító: ${safeExcerpt(identifier.trim(), apiKey)})`;
+    throw new Error(
+      `${model}: a futás külső eszközhívást igényel (requires_action)${idPart}, ez a modul nem hajt végre kliensoldali eszközműveleteket.`,
+    );
+  }
+  if (status !== null && PENDING_STATUSES.has(status)) {
+    if (identifier !== null) return { kind: "pending", id: identifier.trim() };
+    throw new Error(
+      `${model}: érvénytelen válasz, a(z) ${safeExcerpt(statusLabel, apiKey)} állapotú futáshoz nincs azonosító.`,
+    );
+  }
+  if (status === INCOMPLETE_STATUS) {
+    const partial = extractVisibleText(parsed);
+    const continuationToken = extractContinuationToken(parsed);
+    if (partial !== "")
+      return { kind: "incomplete", text: partial, continuationToken };
+    throw new Error(
+      `${model}: a generálás hiányos (incomplete), és nem tartalmaz szöveget; valószínűleg elérte a kimeneti tokenkorlátot.`,
+    );
+  }
+  if (status !== null && !SUCCESS_STATUSES.has(status)) {
+    throw new Error(
+      `${model}: ismeretlen interakcióállapot: ${safeExcerpt(statusLabel, apiKey)}.`,
+    );
+  }
+  const text = extractVisibleText(parsed);
+  if (text !== "") return { kind: "complete", text };
+  throw new Error(`${model}: üres válasz.`);
+}
+
+async function requestJson(
+  model: string,
+  apiKey: string,
+  request: HttpRequest,
+  signal: AbortSignal,
+): Promise<unknown> {
+  const isIdempotent = request.method === "GET";
+  let attempt = 0;
+  for (;;) {
+    if (signal.aborted) throw abortError();
+    const timeout = createTimeoutSignal(signal, ATTEMPT_TIMEOUT_MS);
+    let response: Awaited<ReturnType<typeof fetch>>;
+    let fetchSucceeded = false;
+    try {
+      try {
+        response =
+          request.body === null
+            ? await fetch(request.url, {
+                method: request.method,
+                headers: { "x-goog-api-key": apiKey, Accept: "application/json" },
+                signal: timeout.signal,
+              })
+            : await fetch(request.url, {
+                method: request.method,
+                headers: {
+                  "x-goog-api-key": apiKey,
+                  "Content-Type": "application/json",
+                  Accept: "application/json",
+                },
+                body: request.body,
+                signal: timeout.signal,
+              });
+        fetchSucceeded = true;
+      } catch (error) {
+        if (isAbortError(error)) {
+          if (signal.aborted) throw abortError();
+          throw new Error(
+            `${model}: a kérés időtúllépés miatt megszakadt (${ATTEMPT_TIMEOUT_MS} ms).`,
+          );
+        }
+        if (error instanceof TypeError && isIdempotent && attempt < MAX_RETRIES) {
+          attempt += 1;
+          continue;
+        }
+        if (error instanceof TypeError && !isIdempotent && attempt < MAX_RETRIES) {
+          attempt += 1;
+          continue;
+        }
+        throw new Error(`${model}: ${safeMessage(error, apiKey)}`);
+      }
+      let body: string;
+      try {
+        body = await response.text();
+      } catch (error) {
+        if (isAbortError(error)) {
+          if (signal.aborted) throw abortError();
+          throw new Error(
+            `${model}: a válasz olvasása időtúllépés miatt megszakadt.`,
+          );
+        }
+        if (!isIdempotent && fetchSucceeded) {
+          throw new Error(
+            `${model}: a válasz olvasása megszakadt; a távoli művelet kimenetele ismeretlen. Az újraküldés duplikált futást okozhatna.`,
+          );
+        }
+        if (error instanceof TypeError && attempt < MAX_RETRIES) {
+          attempt += 1;
+          continue;
+        }
+        throw new Error(`${model}: ${safeMessage(error, apiKey)}`);
+      }
+      if (response.ok) {
+        if (body.trim() === "") throw new Error(`${model}: üres választörzs.`);
+        try {
+          return JSON.parse(body) as unknown;
+        } catch {
+          throw new Error(`${model}: érvénytelen válasz.`);
+        }
+      }
+      const failure = describeHttpFailure(body, apiKey, response.status);
+      if (attempt < MAX_RETRIES && isRetryableFailure(response.status, failure)) {
+        const headerDelay = parseRetryAfter(
+          response.headers.get("retry-after"),
+          Date.now(),
+        );
+        const serverDelay =
+          headerDelay === null
+            ? failure.retryDelayMs
+            : failure.retryDelayMs === null
+              ? headerDelay
+              : Math.max(headerDelay, failure.retryDelayMs);
+        if (serverDelay === null || serverDelay <= MAX_RETRY_AFTER_MS) {
+          attempt += 1;
+          const waitMs = effectiveDelay(serverDelay, attempt);
+          timeout.clear();
+          await delay(waitMs, signal);
+          continue;
+        }
+      }
+      throw new Error(`${model} (${response.status}): ${failure.message}`);
+    } finally {
+      timeout.clear();
+    }
   }
 }
 
-export async function multiModelConsensus(question: string, context: string, signal: AbortSignal): Promise<SubagentResult> {
-  const input = `Válaszolj önállóan és indokolva magyarul a kérdésre; ellenőrizd keresővel vagy kóddal, ahol lehet.\n\nKontextus:\n${context || "nincs"}\n\nKérdés:\n${question}`;
-  const settled = await Promise.allSettled(CONSENSUS_MODELS.map((model) => interact(model, input, signal)));
-  const answers = settled.flatMap((entry) => (entry.status === "fulfilled" ? [entry.value] : []));
-  const failures = settled.flatMap((entry) => (entry.status === "rejected" ? [entry.reason instanceof Error ? entry.reason.message : String(entry.reason)] : []));
-  if (!answers.length) return { status: "error", result: { code: "SUBAGENT_FAILED", message: "Egyik modell sem válaszolt.", failures } };
+async function interact(
+  model: string,
+  input: string,
+  apiKey: string,
+  signal: AbortSignal,
+): Promise<ModelAnswer> {
+  if (signal.aborted) throw abortError();
+  const modelId = normalizeModelId(model);
+  const payload = JSON.stringify({
+    model: modelId,
+    input,
+    tools: TOOLS,
+    generation_config: {
+      max_output_tokens: MAX_OUTPUT_TOKENS,
+      thinking_level: THINKING_LEVEL,
+    },
+    background: true,
+    store: false,
+  });
+  const created = await requestJson(
+    modelId,
+    apiKey,
+    { url: INTERACTIONS_URL, method: "POST", body: payload },
+    signal,
+  );
+  let outcome = interpret(modelId, created, apiKey);
+  if (outcome.kind === "complete") {
+    return { model: modelId, text: outcome.text, continuationToken: null };
+  }
+  if (outcome.kind === "incomplete") {
+    return handleIncomplete(modelId, input, apiKey, signal, [outcome.text], outcome.continuationToken);
+  }
+  let pollInterval = POLL_INTERVAL_MS;
+  const pollDeadline = Date.now() + MAX_POLL_DURATION_MS;
+  while (outcome.kind === "pending") {
+    if (Date.now() + pollInterval > pollDeadline) {
+      throw new Error(
+        `${modelId}: az interakció nem fejeződött be a megengedett ${Math.round(MAX_POLL_DURATION_MS / 60000)} percen belül (azonosító: ${safeExcerpt(outcome.id, apiKey)}).`,
+      );
+    }
+    await delay(pollInterval, signal);
+    pollInterval = Math.min(pollInterval * 2, POLL_MAX_INTERVAL_MS);
+    const pollUrl = `${INTERACTIONS_URL}/${encodeURIComponent(outcome.id)}`;
+    const polled = await requestJson(
+      modelId,
+      apiKey,
+      { url: pollUrl, method: "GET", body: null },
+      signal,
+    );
+    outcome = interpret(modelId, polled, apiKey);
+  }
+  if (outcome.kind === "incomplete") {
+    return handleIncomplete(modelId, input, apiKey, signal, [outcome.text], outcome.continuationToken);
+  }
+  return { model: modelId, text: outcome.text, continuationToken: null };
+}
+
+async function handleIncomplete(
+  modelId: string,
+  originalInput: string,
+  apiKey: string,
+  signal: AbortSignal,
+  collectedParts: string[],
+  continuationToken: string | null,
+): Promise<ModelAnswer> {
+  if (continuationToken === null) {
+    return {
+      model: modelId,
+      text: `${collectedParts.join("\n")}${INCOMPLETE_MARKER}`,
+      continuationToken: null,
+    };
+  }
+  let token: string | null = continuationToken;
+  let resumeAttempt = 0;
+  while (token !== null && resumeAttempt < MAX_RESUME_ATTEMPTS) {
+    if (signal.aborted) throw abortError();
+    resumeAttempt += 1;
+    const resumeFields: Record<string, unknown> = {
+      model: modelId,
+      input: originalInput,
+      tools: TOOLS,
+      generation_config: {
+        max_output_tokens: MAX_OUTPUT_TOKENS,
+        thinking_level: THINKING_LEVEL,
+      },
+      background: true,
+      store: false,
+    };
+    for (const key of CONTINUATION_TOKEN_KEYS) {
+      if (key === token) continue;
+    }
+    resumeFields[CONTINUATION_TOKEN_KEYS[0]!] = token;
+    let resumeOutcome: Interpretation;
+    try {
+      const resumePayload = JSON.stringify(resumeFields);
+      const resumeResult = await requestJson(
+        modelId,
+        apiKey,
+        { url: INTERACTIONS_URL, method: "POST", body: resumePayload },
+        signal,
+      );
+      resumeOutcome = interpret(modelId, resumeResult, apiKey);
+    } catch {
+      break;
+    }
+    if (resumeOutcome.kind === "pending") {
+      let pollInterval = POLL_INTERVAL_MS;
+      const pollDeadline = Date.now() + MAX_POLL_DURATION_MS;
+      let polledOutcome: Interpretation = resumeOutcome;
+      while (polledOutcome.kind === "pending") {
+        if (Date.now() + pollInterval > pollDeadline) break;
+        await delay(pollInterval, signal);
+        pollInterval = Math.min(pollInterval * 2, POLL_MAX_INTERVAL_MS);
+        const pollUrl = `${INTERACTIONS_URL}/${encodeURIComponent(polledOutcome.id)}`;
+        try {
+          const polled = await requestJson(
+            modelId,
+            apiKey,
+            { url: pollUrl, method: "GET", body: null },
+            signal,
+          );
+          polledOutcome = interpret(modelId, polled, apiKey);
+        } catch {
+          break;
+        }
+      }
+      if (polledOutcome.kind === "pending") break;
+      resumeOutcome = polledOutcome;
+    }
+    if (resumeOutcome.kind === "complete") {
+      collectedParts.push(resumeOutcome.text);
+      return {
+        model: modelId,
+        text: collectedParts.join("\n"),
+        continuationToken: null,
+      };
+    }
+    if (resumeOutcome.kind === "incomplete") {
+      collectedParts.push(resumeOutcome.text);
+      token = resumeOutcome.continuationToken;
+      continue;
+    }
+    break;
+  }
+  const finalToken = token;
+  return {
+    model: modelId,
+    text: `${collectedParts.join("\n")}${INCOMPLETE_MARKER}`,
+    continuationToken: finalToken,
+  };
+}
+
+function abortedResult(): SubagentErrorResult {
+  return { status: "error", result: { code: "ABORTED", message: ABORTED_MESSAGE } };
+}
+
+function errorResult(error: unknown, signal: AbortSignal): SubagentErrorResult {
+  if (isAbortError(error)) return abortedResult();
+  if (signal.aborted && !(error instanceof Error && rawMessage(error) !== GENERIC_FAILURE_MESSAGE))
+    return abortedResult();
+  return {
+    status: "error",
+    result: { code: "SUBAGENT_FAILED", message: safeMessage(error) },
+  };
+}
+
+function boundAnswerText(text: string): string {
+  return capCodePoints(text, MAX_SYNTHESIS_ANSWER_CODE_POINTS, TRUNCATED_MARKER);
+}
+
+function textOrDefault(value: unknown, fallback: string): string {
+  if (typeof value !== "string") return fallback;
+  return value.trim() === "" ? fallback : value;
+}
+
+function requireText(value: unknown, name: string): string {
+  if (typeof value !== "string" || value.trim() === "")
+    throw new Error(`A(z) ${name} paraméter nem lehet üres.`);
+  return value;
+}
+
+export async function delegateTask(
+  task: string,
+  context: string,
+  signal: AbortSignal,
+): Promise<SubagentDelegateResult | SubagentErrorResult> {
   try {
-    const synthesisInput = `Több modell független válaszát kaptad ugyanarra a kérdésre. Hasonlítsd össze őket: hol értenek egyet, hol térnek el, melyik érvelés erősebb. Adj végső, megalapozott konszenzusválaszt és bizonyossági szintet magyarul.\n\nKérdés:\n${question}\n\n${answers.map((answer, index) => `### ${index + 1}. válasz (${answer.model})\n${answer.text}`).join("\n\n")}`;
-    const synthesis = await interact(ADVISOR_MODEL, synthesisInput, signal);
-    return { status: "completed", result: { consensus: synthesis.text, answers: answers.map((answer) => ({ model: answer.model, answer: answer.text })), failures } };
+    if (signal.aborted) return abortedResult();
+    const taskText = requireText(task, "task");
+    const apiKey = readApiKey();
+    const input = `Önálló alügynök vagy. Hajtsd végre pontosan a részfeladatot; kódfuttatást, Google keresést és URL-olvasást használhatsz. Adj tömör, ellenőrzött eredményt magyarul, forrásokkal ha kerestél.\n\nKontextus:\n${textOrDefault(context, "nincs")}\n\nRészfeladat:\n${taskText}`;
+    const answer = await interact(FAST_MODEL, input, apiKey, signal);
+    return {
+      status: "completed",
+      result: { model: answer.model, answer: answer.text },
+    };
   } catch (error) {
-    return { status: "completed", result: { consensus: null, synthesis_error: error instanceof Error ? error.message : String(error), answers: answers.map((answer) => ({ model: answer.model, answer: answer.text })), failures } };
+    return errorResult(error, signal);
+  }
+}
+
+export async function consultAdvisor(
+  question: string,
+  context: string,
+  signal: AbortSignal,
+): Promise<SubagentAdvisorResult | SubagentErrorResult> {
+  try {
+    if (signal.aborted) return abortedResult();
+    const questionText = requireText(question, "question");
+    const apiKey = readApiKey();
+    const input = `Szakértő tanácsadó vagy egy autonóm ügynök mellett. Elemezd a helyzetet, mutass rá hibákra és kockázatokra, és adj konkrét, sorrendbe állított javaslatot a továbblépésre magyarul.\n\nHelyzet:\n${textOrDefault(context, "nincs")}\n\nKérdés:\n${questionText}`;
+    const answer = await interact(ADVISOR_MODEL, input, apiKey, signal);
+    return {
+      status: "completed",
+      result: { model: answer.model, advice: answer.text },
+    };
+  } catch (error) {
+    return errorResult(error, signal);
+  }
+}
+
+export async function multiModelConsensus(
+  question: string,
+  context: string,
+  signal: AbortSignal,
+): Promise<SubagentConsensusResult | SubagentErrorResult> {
+  let apiKey: string;
+  let questionText: string;
+  try {
+    if (signal.aborted) return abortedResult();
+    questionText = requireText(question, "question");
+    apiKey = readApiKey();
+  } catch (error) {
+    return errorResult(error, signal);
+  }
+  const input = `Válaszolj önállóan és indokolva magyarul a kérdésre; ellenőrizd keresővel vagy kóddal, ahol lehet.\n\nKontextus:\n${textOrDefault(context, "nincs")}\n\nKérdés:\n${questionText}`;
+  const settled = await Promise.allSettled(
+    CONSENSUS_MODELS.map((model) => interact(model, input, apiKey, signal)),
+  );
+  const collected: ModelAnswer[] = [];
+  const failures: string[] = [];
+  settled.forEach((entry, index) => {
+    if (entry.status === "fulfilled") {
+      collected.push(entry.value);
+      return;
+    }
+    const modelName = normalizeModelId(CONSENSUS_MODELS[index] ?? "ismeretlen");
+    const message = isAbortError(entry.reason)
+      ? ABORTED_MESSAGE
+      : safeMessage(entry.reason, apiKey);
+    failures.push(message.startsWith(modelName) ? message : `${modelName}: ${message}`);
+  });
+  const answers: SubagentAnswer[] = collected.map((entry) => ({
+    model: entry.model,
+    answer: entry.text,
+  }));
+  if (signal.aborted) {
+    const payload: SubagentErrorPayload = { code: "ABORTED", message: ABORTED_MESSAGE };
+    if (failures.length > 0) payload.failures = failures;
+    if (answers.length > 0) payload.answers = answers;
+    return { status: "error", result: payload };
+  }
+  if (answers.length === 0) {
+    return {
+      status: "error",
+      result: {
+        code: "SUBAGENT_FAILED",
+        message: NO_MODEL_ANSWERED_MESSAGE,
+        failures,
+      },
+    };
+  }
+  try {
+    const transcript = collected
+      .map(
+        (entry, index) =>
+          `### ${index + 1}. válasz (${entry.model})\n${boundAnswerText(entry.text)}`,
+      )
+      .join("\n\n");
+    const synthesisInput = `Több modell független válaszát kaptad ugyanarra a kérdésre. Hasonlítsd össze őket: hol értenek egyet, hol térnek el, melyik érvelés erősebb. Adj végső, megalapozott konszenzusválaszt és bizonyossági szintet magyarul.\n\nKérdés:\n${questionText}\n\n${transcript}`;
+    const synthesis = await interact(ADVISOR_MODEL, synthesisInput, apiKey, signal);
+    return {
+      status: "completed",
+      result: { consensus: synthesis.text, answers, failures },
+    };
+  } catch (error) {
+    const aborted = isAbortError(error);
+    const synthesisError = aborted ? ABORTED_MESSAGE : safeMessage(error, apiKey);
+    const payload: SubagentErrorPayload = {
+      code: aborted ? "ABORTED" : "SUBAGENT_FAILED",
+      message: synthesisError,
+      answers,
+      synthesis_error: synthesisError,
+    };
+    if (failures.length > 0) payload.failures = failures;
+    return { status: "error", result: payload };
   }
 }
